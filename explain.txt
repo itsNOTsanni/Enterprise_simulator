@@ -1,0 +1,8 @@
+config/ asset_registry.yaml -- Contains Registry of the Organisation...It mention who can access what
+
+shared/ -- shared/ contains code that all members should reuse; simulator/ contains the unique simulation logic owned by each member.
+
+simulator/ -- To build simulator
+
+tests/-- To test the Code
+
