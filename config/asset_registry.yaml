@@ -119,6 +119,7 @@ assets:
     asset_type: employee_workstation
     hostname: employee-01
     ip_address: 10.10.1.31
+    mac_address: "02:1A:2B:3C:4D:01"
 
     # Logical enterprise asset profile.
     os: Windows
@@ -142,6 +143,7 @@ assets:
     asset_type: employee_workstation
     hostname: employee-02
     ip_address: 10.10.1.32
+    mac_address: "02:1A:2B:3C:4D:02"
 
     # Logical enterprise asset profile.
     os: Windows
@@ -165,6 +167,7 @@ assets:
     asset_type: employee_workstation
     hostname: employee-03
     ip_address: 10.10.1.33
+    mac_address: "02:1A:2B:3C:4D:03"
 
     # Logical enterprise asset profile.
     os: Windows
@@ -189,6 +192,7 @@ assets:
     asset_type: employee_workstation
     hostname: employee-04
     ip_address: 10.10.1.34
+    mac_address: "02:1A:2B:3C:4D:04"
 
     # Logical enterprise asset profile.
     os: Windows
