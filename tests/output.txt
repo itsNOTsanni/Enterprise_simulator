@@ -1,0 +1,14 @@
+python -m tests.test_web_simulator -v
+python -m tests.test_endpoint_simulator -v
+python -m tests.test_cloud_simulator -v
+python -m tests.test_db_simulator -v
+
+
+
+python -m simulator.database.db_simulator
+python -m simulator.cloud.cloud_simulator
+python -m simulator.endpoints.endpoint_simulator
+
+
+python -m agents.network_agent
+python -m simulator.web.web_simulator

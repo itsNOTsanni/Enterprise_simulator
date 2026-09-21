@@ -1,6 +1,26 @@
 config/ asset_registry.yaml -- Contains Registry of the Organisation...It mention who can access what
 
-shared/ -- shared/ contains code that all members should reuse; simulator/ contains the unique simulation logic owned by each member.
+shared/ --  contains code that all members should reuse; simulator/ contains the unique simulation logic owned by each member.
+
+    base_simulator.py-
+        A template saying "every simulator must have a way to make normal events and a way to make attack events"
+        Keeps all 4 simulators built the same way, so they're structured consistently
+        It is the common foundation of all the assets in simulation
+        Instead of writing the same code for each asset again and again we inherit from base simulator
+
+    event_schema.py-
+    	The strict form every event must fill out (who, what, when, where, result)	
+        Makes a web event and a database event look structurally identical — critical for a future AI to read all 4 at once
+
+    enums.py-	
+    A fixed list of allowed words for things like status (success/failure/blocked) and category (web/database/network...)	
+    Stops one simulator from writing "Success" and another writing "OK" — keeps wording identical everywhere
+
+shared/utils/config_loader.py-- config_loader.py is used to load and provide access to the enterprise configuration data from asset_registry.yaml.
+
+
+
+
 
 simulator/ -- To build simulator
 

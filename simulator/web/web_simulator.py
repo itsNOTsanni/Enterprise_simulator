@@ -1,3 +1,22 @@
+"""
+simulator/web/web_simulator.py
+
+Web Server (WEB-01) simulator.
+
+Generates normal and attack traffic against the enterprise web server
+(WEB-01: Ubuntu / Flask / Nginx, ports 80 + 443) using the shared
+BaseSimulator interface and CommonEvent schema, so every event this
+module produces is structurally identical to events from every other
+asset simulator.
+
+Integrates with:
+    shared.base.base_simulator.BaseSimulator
+    shared.schemas.event_schema.CommonEvent
+    shared.utils.id_generator.generate_event_id
+    shared.utils.timestamp.get_utc_timestamp
+    shared.utils.config_loader.get_asset / get_employee
+    shared.constants.enums.EventCategory / EventStatus / Protocol / AssetType
+"""
 
 import random
 import threading
@@ -741,8 +760,13 @@ class WebServerSimulator(BaseSimulator):
 
 if __name__ == "__main__":
     # Demo: normal traffic runs continuously in the background; you
-    # select attacks interactively while it keeps running.
+    # select attacks interactively while it keeps running. Every event
+    # -- normal or attack -- is also persisted via
+    # shared.storage.event_writer, exactly like run_soc_feed.py does,
+    # so running this file directly saves data too, not just prints it.
     import json
+
+    from shared.storage.event_writer import write_event, DEFAULT_EVENT_LOG_PATH, DEFAULT_GROUND_TRUTH_PATH
 
     def _print_event(event: CommonEvent, prefix: str = "") -> None:
         dump = event.model_dump() if hasattr(event, "model_dump") else event.dict()
@@ -761,10 +785,11 @@ if __name__ == "__main__":
 
         print("(Live mode: normal traffic prints in real time as it happens.)\n")
 
-        sim.start_normal_stream(
-            on_event=lambda e: _print_event(e, prefix="[NORMAL] "),
-            interval_seconds=2.0,
-        )
+        def normal_handler(e):
+            write_event(e, is_attack=False)
+            _print_event(e, prefix="[NORMAL] ")
+
+        sim.start_normal_stream(on_event=normal_handler, interval_seconds=2.0)
 
         session: PromptSession = PromptSession()
 
@@ -775,11 +800,13 @@ if __name__ == "__main__":
                     break
                 if not selection:
                     continue
+
+                def attack_handler(e, _attack_type=selection):
+                    write_event(e, is_attack=True, attack_type=_attack_type)
+                    _print_event(e, prefix="[ATTACK] ")
+
                 try:
-                    sim.trigger_attack(
-                        selection,
-                        on_event=lambda e: _print_event(e, prefix="[ATTACK] "),
-                    )
+                    sim.trigger_attack(selection, on_event=attack_handler)
                 except ValueError as exc:
                     print(exc)
 
@@ -805,10 +832,11 @@ if __name__ == "__main__":
         print("(Buffered mode: normal traffic prints between prompts, not live.")
         print(" `pip install prompt_toolkit` for real-time output.)\n")
 
-        sim.start_normal_stream(
-            on_event=lambda e: event_queue.put(("[NORMAL] ", e)),
-            interval_seconds=2.0,
-        )
+        def normal_handler(e):
+            write_event(e, is_attack=False)
+            event_queue.put(("[NORMAL] ", e))
+
+        sim.start_normal_stream(on_event=normal_handler, interval_seconds=2.0)
 
         while True:
             _drain_event_queue()
@@ -818,11 +846,13 @@ if __name__ == "__main__":
                 break
             if not selection:
                 continue
+
+            def attack_handler(e, _attack_type=selection):
+                write_event(e, is_attack=True, attack_type=_attack_type)
+                event_queue.put(("[ATTACK] ", e))
+
             try:
-                sim.trigger_attack(
-                    selection,
-                    on_event=lambda e: event_queue.put(("[ATTACK] ", e)),
-                )
+                sim.trigger_attack(selection, on_event=attack_handler)
                 _drain_event_queue()
             except ValueError as exc:
                 print(exc)
@@ -831,6 +861,8 @@ if __name__ == "__main__":
 
     print("Starting continuous WEB-01 normal traffic (Ctrl+C / 'quit' to stop).")
     print("Available attacks:", ", ".join(_sim.available_attack_types()))
+    print(f"Event log:        {DEFAULT_EVENT_LOG_PATH}")
+    print(f"Ground truth log: {DEFAULT_GROUND_TRUTH_PATH}")
 
     try:
         try:
