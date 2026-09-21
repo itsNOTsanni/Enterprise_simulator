@@ -1,0 +1,49 @@
+tests/test_web_simulator.py is a testing file for your Web Server Simulator.
+
+Output command:
+python -m simulator.web.web_simulator
+python -m tests.test_web_simulator -v
+
+
+Normal Events
+# | Event Type               | What it represents                                                                               |
+- | ------------------------ | ------------------------------------------------------------------------------------------------ |
+1 | **Login Attempt**        | A legitimate employee logs into the web application successfully.                                |
+2 | **Page View**            | A user visits a normal web page such as `/dashboard`, `/profile`, or `/settings`.                |
+3 | **Form Submission**      | A user submits a legitimate form, for example creating an order.                                 |
+4 | **API Call**             | The web application receives a normal API request such as `/api/v1/profile` or `/api/v1/orders`. |
+5 | **Static Asset Request** | A browser requests normal files such as CSS, JavaScript, or images.                              |
+6 | **Logout**               | A legitimate user ends their session and logs out.                                               |
+
+
+Malicious events
+#  | Attack                    | Event Type                  | Simple Meaning                                                                             |
+-- | ------------------------- | --------------------------- | ------------------------------------------------------------------------------------------ |
+1  | **Brute Force**           | `login_attempt`             | Repeated login attempts using different credentials to gain access.                        |
+2  | **SQL Injection**         | `sql_injection_attempt`     | Malicious input is sent to try to manipulate the database query.                           |
+3  | **XSS**                   | `xss_attempt`               | Malicious script content is submitted to try to affect users viewing the application.      |
+4  | **Path Traversal**        | `path_traversal_attempt`    | Attempts to access files or directories outside the allowed web location.                  |
+                    |
+5  | **Command Injection**     | `command_injection_attempt` | Malicious input attempts to make the server execute unintended system commands.            |
+        |
+6  | **CSRF**                  | Request/action event        | Attempts to cause an authenticated user's browser/session to perform an unintended action. |
+7  | **SSRF**                  | Server-side request event   | Attempts to make the server send requests to internal or unintended resources.             |
+8  | **Insecure File Upload**  | File-upload event           | Attempts to upload a suspicious or improperly validated file.                              |
+
+
+
+
+The Web Simulator is a Python-based component of our simulated enterprise environment that generates realistic web server activity 
+in the form of standardized event logs. It continuously generates normal user activities such as login attempts, page views, API calls,form 
+submissions, static asset requests, and logout events. At the same time, when a particular attack is selected, it generates the 
+corresponding malicious event or sequence of events, such as brute-force attacks, SQL injection, XSS, path traversal, directory brute force,
+command injection, CSRF, SSRF, broken access control, or insecure file upload. The simulator uses Python classes, threading for 
+continuous normal traffic, callbacks for sending generated events, and a CommonEvent schema to maintain a consistent event structure.
+Each event contains details such as event ID, timestamp, source and destination IP addresses, user or attacker information, event type,
+target resource, HTTP details, and simulation context. Normal traffic continues running even when an attack is triggered, creating a
+mixed stream of realistic enterprise activity and malicious events. The generated events can later be collected, stored, and analyzed
+by our SOC monitoring and detection agents. We also use Python’s unittest framework to test the simulator and verify that all normal
+activities, attack scenarios, event structures, IP addresses, continuous streaming, and on-demand attack generation work correctly.
+
+
+
