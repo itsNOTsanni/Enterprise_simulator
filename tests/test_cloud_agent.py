@@ -1,17 +1,23 @@
 """
 tests/test_cloud_agent.py
 
-Unit tests for agents/cloud_agent.py and shared/storage/event_tailer.py.
+Unit tests for the pattern-based Cloud Agent (agents/cloud_agent.py)
+and shared/storage/event_tailer.py.
 
-Attack and normal events come from the REAL CloudSimulator (and the
-other real simulators), so the tests break if the agent drifts away
-from what the simulators actually produce.
+The agent knows no attack names. These tests check that:
+  - normal traffic from the REAL CloudSimulator is never flagged
+  - all 6 simulator cloud attacks are flagged
+  - attack VARIANTS the agent was never written for are flagged too
+    (hand-built events: different API actions, roles, ports, resources)
+  - weak signals alone (new action, unfamiliar IP) never raise a flag
+  - continuous monitoring, de-duplication and bad input all behave
 
 Run with:
     python -m tests.test_cloud_agent -v
 """
 
 import json
+import random
 import tempfile
 import threading
 import time
@@ -53,20 +59,52 @@ def rules(flags):
     return {f.rule for f in flags}
 
 
-def cloud_event(api_action, event_type, user_id="EMP-003", source_ip="10.10.1.33", **data):
-    """A hand-built cloud event matching CloudSimulator._build_event's shape."""
+_counter = iter(range(10**9))
+
+RESOURCE_TYPES = {"IAM-01": "identity_management", "SEC-01": "security_configuration",
+                  "STORAGE-01": "object_storage", "API-01": "cloud_api", "CLOUD-VM-01": "virtual_machine"}
+
+
+def cloud_event(api_action, user_id="EMP-003", source_ip="10.10.1.33", resource="IAM-01",
+                action="modify", event_type="cloud_change", **data):
+    """A hand-built cloud event in the same shape as CloudSimulator._build_event."""
     return {
-        "event_id": f"EVT-CLOUD-{abs(hash((api_action, user_id, source_ip, str(data)))) % 10**8:08d}",
+        "event_id": f"EVT-CLOUD-T{next(_counter):08d}",
         "timestamp": str(T0),
         "source": {"asset_id": "CLOUD-01", "asset_type": "cloud_environment", "hostname": "cloud-01"},
         "network": {"source_ip": source_ip, "source_port": None, "destination_ip": None,
                     "destination_port": None, "protocol": None},
         "actor": {"user_id": user_id, "session_id": "CLOUD-SESSION-TEST"},
-        "event": {"category": "iam", "type": event_type, "action": "modify", "status": "success"},
-        "target": {"asset_id": "CLOUD-01", "resource": "IAM-01", "resource_type": "identity_management"},
-        "data": {"api_action": api_action, "call_source": "employee03", **data},
+        "event": {"category": "cloud", "type": event_type, "action": action, "status": "success"},
+        "target": {"asset_id": "CLOUD-01", "resource": resource, "resource_type": RESOURCE_TYPES[resource]},
+        "data": {"api_action": api_action, **data},
         "context": {"environment": "simulated_enterprise", "simulation": True},
     }
+
+
+def normal_stream(n, interval=2.0, jitter=0.5, start=0.0, seed=1):
+    """n real normal cloud events, timed like start_normal_stream (interval +/- jitter)."""
+    rng, sim, t, out = random.Random(seed), CloudSimulator(), start, []
+    for _ in range(n):
+        t += interval + rng.uniform(-jitter, jitter)
+        out.append(at(as_dict(sim.generate_normal_event()), t))
+    return out, t
+
+
+def warmed_agent(n=600):
+    """An agent that has watched n normal events (as it would in real use)."""
+    agent = CloudAgent()
+    events, t = normal_stream(n)
+    assert agent.analyze(events) == []
+    return agent, t
+
+
+def timed(events, start, step=0.15):
+    return [at(e, start + 1 + step * i) for i, e in enumerate(events)]
+
+
+def patterns(flags):
+    return {p for f in flags for p in f.patterns}
 
 
 # ======================================================================
@@ -75,162 +113,196 @@ def cloud_event(api_action, event_type, user_id="EMP-003", source_ip="10.10.1.33
 
 class TestNormalCloudActivity(unittest.TestCase):
 
-    def test_large_batch_of_real_normal_events_raises_nothing(self):
-        # 1500 events at the simulator's default 2 s stream cadence (~50 min).
-        sim, agent = CloudSimulator(), CloudAgent()
-        events = [at(as_dict(sim.generate_normal_event()), 2 * i) for i in range(1500)]
-        self.assertEqual(agent.analyze(events), [])
-        self.assertEqual(agent.stats["cloud_events_analyzed"], 1500)
+    def test_real_normal_traffic_is_never_flagged_at_several_speeds(self):
+        for interval in (1.0, 2.0, 3.0):
+            agent = CloudAgent()
+            events, _ = normal_stream(1500, interval=interval, seed=int(interval * 10))
+            self.assertEqual(agent.analyze(events), [], f"false positive at {interval}s cadence")
+            self.assertEqual(agent.stats["cloud_events_analyzed"], 1500)
 
-    def test_each_normal_generator_individually_raises_nothing(self):
-        sim, agent = CloudSimulator(), CloudAgent()
-        generators = [
-            sim._normal_cloud_storage_access, sim._normal_vm_session, sim._normal_cloud_api_call,
-            sim._normal_security_config_review, sim._normal_storage_config_review,
-            sim._normal_iam_policy_check, sim._normal_role_update,
-        ]
-        for i, gen in enumerate(generators * 20):
-            flags = agent.process_event(at(as_dict(gen()), 10 * i))
-            self.assertEqual(flags, [], f"{gen.__name__} was flagged")
+    def test_agent_learns_a_baseline(self):
+        agent, _ = warmed_agent()
+        self.assertTrue(agent.baseline.warmed_up)
+        self.assertIn("s3:GetObject", agent.baseline.actions)
+        self.assertAlmostEqual(agent.baseline.median_gap(), 2.0, delta=0.3)
 
     def test_unfamiliar_location_alone_is_not_a_flag(self):
-        # A perfectly ordinary read, but from an external IP: supporting
-        # evidence only, never an alert by itself.
-        event = at(as_dict(CloudSimulator()._normal_cloud_storage_access()), 0)
+        agent, t = warmed_agent()
+        event = at(as_dict(CloudSimulator()._normal_cloud_storage_access()), t + 1)
         event["network"]["source_ip"] = "203.0.113.50"
-        self.assertEqual(CloudAgent().process_event(event), [])
+        self.assertEqual(agent.process_event(event), [])
+
+    def test_novelty_alone_is_not_a_flag(self):
+        # admin, own laptop, brand-new action AND brand-new config value -- but it
+        # strengthens security, so nothing suspicious beyond "new"
+        agent, t = warmed_agent()
+        event = at(cloud_event("iam:EnableMFADevice", config_before="mfa_disabled",
+                               config_after="mfa_enabled"), t + 1)
+        self.assertEqual(agent.process_event(event), [])
+
+    def test_admin_routine_change_from_own_laptop_not_flagged(self):
+        agent, t = warmed_agent()
+        event = at(cloud_event("iam:UpdateRole", config_before="employee", config_after="manager"), t + 1)
+        self.assertEqual(agent.process_event(event), [])
 
     def test_blocked_status_alone_is_not_a_flag(self):
-        event = at(as_dict(CloudSimulator()._normal_vm_session()), 0)
+        agent, t = warmed_agent()
+        event = at(as_dict(CloudSimulator()._normal_vm_session()), t + 1)
         event["event"]["status"] = "blocked"
-        self.assertEqual(CloudAgent().process_event(event), [])
+        self.assertEqual(agent.process_event(event), [])
+
+    def test_no_attack_names_in_output(self):
+        agent, t = warmed_agent()
+        flags = agent.analyze(timed(attack_events("mfa_disablement"), t))
+        self.assertEqual({f.rule for f in flags}, {"suspicious_cloud_activity"})
 
 
 # ======================================================================
-# One test per cloud attack
+# The 6 simulator attacks
 # ======================================================================
 
-class TestCloudAttackDetection(unittest.TestCase):
+class TestSimulatorAttacksDetected(unittest.TestCase):
 
-    def test_iam_privilege_escalation_detected(self):
-        flags = CloudAgent().analyze(attack_events("iam_privilege_escalation"))
-        self.assertEqual(rules(flags), {"iam_privilege_escalation"})
-        flag = flags[0]
-        self.assertIn(flag.evidence["config_after"], ("admin", "owner"))
-        self.assertEqual(flag.severity, "high")
+    def check(self, attack, expected_patterns, **kwargs):
+        agent, t = warmed_agent()
+        flags = agent.analyze(timed(attack_events(attack, **kwargs), t))
+        self.assertTrue(flags, f"{attack} not detected")
+        self.assertTrue(expected_patterns & patterns(flags),
+                        f"{attack}: expected one of {expected_patterns}, got {patterns(flags)}")
+        return flags
 
-    def test_escalation_confidence_depends_on_supporting_evidence(self):
-        # IT admin promoting someone to admin from their own workstation: a lead, medium.
-        legit_looking = cloud_event("iam:UpdateRole", "role_update", config_before="employee", config_after="admin")
-        flag = CloudAgent().process_event(legit_looking)[0]
-        self.assertEqual(flag.confidence, "medium")
-        self.assertEqual(flag.evidence["supporting_signals"], [])
+    def test_iam_privilege_escalation(self):
+        flags = self.check("iam_privilege_escalation", {"security_weakening"})
+        self.assertEqual(flags[0].severity, "high")
 
-        # Unprivileged HR user, from outside: high.
-        suspicious = cloud_event("iam:UpdateRole", "role_update", user_id="EMP-002", source_ip="198.51.100.77",
-                                 config_before="employee", config_after="admin")
-        flag = CloudAgent().process_event(suspicious)[0]
-        self.assertEqual(flag.confidence, "high")
-        self.assertIn("caller_not_privileged", flag.evidence["supporting_signals"])
-        self.assertIn("caller_location=external", flag.evidence["supporting_signals"])
+    def test_mfa_disablement(self):
+        self.check("mfa_disablement", {"security_weakening"})
 
-    def test_role_downgrade_or_unknown_roles_not_flagged(self):
-        agent = CloudAgent()
-        self.assertEqual(agent.process_event(cloud_event(
-            "iam:UpdateRole", "role_update", config_before="admin", config_after="employee")), [])
-        self.assertEqual(agent.process_event(cloud_event(
-            "iam:UpdateRole", "role_update", config_before="intern", config_after="wizard")), [])
-
-    def test_mfa_disablement_detected(self):
-        flags = CloudAgent().analyze(attack_events("mfa_disablement"))
-        self.assertEqual(rules(flags), {"mfa_disablement"})
-        self.assertEqual(flags[0].confidence, "high")
-
-    def test_public_bucket_exposure_detected(self):
-        flags = CloudAgent().analyze(attack_events("public_bucket_exposure"))
-        self.assertEqual(rules(flags), {"public_bucket_exposure"})
-        self.assertEqual(flags[0].severity, "critical")
-        self.assertEqual(flags[0].resource, "STORAGE-01")
-
-    def test_bucket_made_private_not_flagged(self):
-        event = cloud_event("s3:PutBucketAcl", "storage_config_review",
-                            config_before="public-read", config_after="private")
-        self.assertEqual(CloudAgent().process_event(event), [])
-
-    def test_security_group_misconfiguration_detected(self):
-        flags = CloudAgent().analyze(attack_events("security_group_misconfiguration"))
-        self.assertEqual(rules(flags), {"security_group_misconfiguration"})
-        self.assertEqual(flags[0].evidence["exposed_port"], 22)
+    def test_public_bucket_exposure(self):
+        flags = self.check("public_bucket_exposure", {"security_weakening"})
         self.assertEqual(flags[0].severity, "critical")
 
-    def test_security_group_internal_only_rule_not_flagged(self):
-        event = cloud_event("ec2:AuthorizeSecurityGroupIngress", "security_config_review",
-                            config_before="none", config_after="10.10.1.0/24:443")
-        self.assertEqual(CloudAgent().process_event(event), [])
+    def test_security_group_misconfiguration(self):
+        flags = self.check("security_group_misconfiguration", {"security_weakening"})
+        self.assertEqual(flags[0].severity, "critical")
 
-    def test_mass_data_exfiltration_detected(self):
-        events = attack_events("mass_data_exfiltration", burst_size=12)
-        flags = CloudAgent().analyze(events)
-        self.assertEqual(rules(flags), {"mass_data_exfiltration"})
-        # The threshold may be crossed by COUNT (5 reads) or earlier by
-        # VOLUME (25 MB -- attack reads are up to 20 MB each). Either way,
-        # the first flag covers the window so far, later reads get
-        # continuation flags, every event of the burst ends up covered,
-        # and all flags share one correlation key.
-        self.assertLessEqual(len(flags[0].event_ids), 5)
-        covered = {eid for f in flags for eid in f.event_ids}
-        self.assertEqual(covered, {e["event_id"] for e in events})
-        self.assertEqual(len({f.correlation_key for f in flags}), 1)
+    def test_mass_data_exfiltration(self):
+        events_flags = self.check("mass_data_exfiltration", {"activity_burst", "bulk_data_transfer"}, burst_size=10)
+        self.assertEqual(len({f.correlation_key for f in events_flags if f.correlation_key}), 1)
 
-    def test_few_normal_reads_or_spread_out_reads_not_exfiltration(self):
-        sim, agent = CloudSimulator(), CloudAgent()
-        reads = []
-        while len(reads) < 5:
-            e = as_dict(sim._normal_cloud_storage_access())
-            if e["data"]["api_action"] == "s3:GetObject" and e["actor"]["user_id"] == "EMP-001":
-                reads.append(e)
-        # 5 reads by one user, but one every 2 minutes: normal pace
-        self.assertEqual(agent.analyze([at(e, 120 * i) for i, e in enumerate(reads)]), [])
+    def test_api_key_abuse(self):
+        flags = self.check("api_key_abuse", {"activity_burst"}, burst_size=8)
+        self.assertIn("enumeration", patterns(flags))
 
-    def test_exfiltration_by_volume_alone(self):
-        agent = CloudAgent()
-        events = []
-        for i in range(3):  # only 3 reads, but 3 x 10 MB = 30 MB in 3 seconds
-            e = as_dict(CloudSimulator()._attack_mass_data_exfiltration(employee_id="EMP-004", username="employee04"))
-            e["data"]["bytes_transferred"] = 10_000_000
-            events.append(at(e, i))
-        self.assertEqual(rules(agent.analyze(events)), {"mass_data_exfiltration"})
+    def test_detected_even_without_warm_up(self):
+        for attack in CloudSimulator().available_attack_types():
+            events = attack_events(attack, burst_size=8) if attack in ("mass_data_exfiltration", "api_key_abuse") \
+                else attack_events(attack)
+            self.assertTrue(CloudAgent().analyze(timed(events, 0)), f"{attack} missed with a cold agent")
 
-    def test_normal_read_after_burst_ends_is_not_a_new_exfiltration(self):
-        agent = CloudAgent()
-        burst = [at(e, i * 0.2) for i, e in enumerate(attack_events("mass_data_exfiltration", burst_size=6))]
+
+# ======================================================================
+# Attack VARIANTS the agent was never written for
+# ======================================================================
+
+class TestUnseenAttackVariants(unittest.TestCase):
+    """None of these API actions, roles, ports or resources appear in the agent's code."""
+
+    def detect(self, events, step=0.15):
+        agent, t = warmed_agent()
+        flags = agent.analyze(timed(events, t, step))
+        self.assertTrue(flags, "variant not detected")
+        return flags
+
+    def test_escalation_to_a_different_role_name(self):
+        flags = self.detect([cloud_event("iam:UpdateRole", user_id="EMP-002", source_ip="10.10.1.32",
+                                         config_before="employee", config_after="superuser")])
+        self.assertIn("security_weakening", patterns(flags))
+
+    def test_admin_policy_attached_via_different_api(self):
+        self.detect([cloud_event("iam:AttachUserPolicy", user_id="EMP-004", source_ip="203.0.113.9",
+                                 config_before="ReadOnly", config_after="AdministratorAccess")])
+
+    def test_audit_logging_stopped(self):
+        flags = self.detect([cloud_event("cloudtrail:StopLogging", user_id="EMP-001", source_ip="10.10.1.31",
+                                         resource="SEC-01", config_before="logging_enabled",
+                                         config_after="logging_disabled")])
+        self.assertIn("security_weakening", patterns(flags))
+
+    def test_new_access_key_created_by_non_admin(self):
+        flags = self.detect([cloud_event("iam:CreateAccessKey", user_id="EMP-001", source_ip="198.51.100.4",
+                                         action="create")])
+        self.assertIn("sensitive_change_by_non_admin", patterns(flags))
+
+    def test_other_port_opened_to_internet_even_by_admin(self):
+        flags = self.detect([cloud_event("ec2:ModifySecurityGroupRules", resource="SEC-01",
+                                         config_before="internal_only", config_after="0.0.0.0/0:3389")])
+        self.assertEqual(flags[0].severity, "critical")
+
+    def test_storage_encryption_disabled(self):
+        self.detect([cloud_event("s3:PutBucketEncryption", user_id="EMP-002", source_ip="10.10.1.32",
+                                 resource="STORAGE-01", config_before="encryption_enabled",
+                                 config_after="encryption_disabled")])
+
+    def test_exfiltration_via_different_api(self):
+        flags = self.detect([cloud_event("s3:CopyObject", user_id="EMP-004", source_ip="10.10.1.34",
+                                         resource="STORAGE-01", action="read", bytes_transferred=8_000_000)
+                             for _ in range(8)])
+        self.assertIn("activity_burst", patterns(flags))
+
+    def test_mass_deletion(self):
+        flags = self.detect([cloud_event("s3:DeleteObject", user_id="EMP-001", source_ip="10.10.1.31",
+                                         resource="STORAGE-01", action="delete") for _ in range(10)])
+        self.assertIn("activity_burst", patterns(flags))
+
+    def test_reconnaissance_via_other_apis(self):
+        actions = ["lambda:ListFunctions", "rds:DescribeDBInstances", "kms:ListKeys",
+                   "organizations:ListAccounts", "sts:GetCallerIdentity", "ec2:DescribeVpcs"]
+        flags = self.detect([cloud_event(a, user_id="EMP-002", source_ip="203.0.113.77", resource="API-01",
+                                         action="request") for a in actions])
+        self.assertIn("enumeration", patterns(flags))
+
+    def test_slow_large_download(self):
+        flags = self.detect([cloud_event("s3:GetObject", user_id="EMP-002", source_ip="10.10.1.32",
+                                         resource="STORAGE-01", action="read", bytes_transferred=20_000_000)
+                             for _ in range(3)], step=20)
+        self.assertIn("bulk_data_transfer", patterns(flags))
+
+
+# ======================================================================
+# Confidence reflects how many patterns agree
+# ======================================================================
+
+class TestScoring(unittest.TestCase):
+
+    def test_more_patterns_means_higher_confidence(self):
+        agent, t = warmed_agent()
+        admin_own_laptop = at(cloud_event("iam:UpdateRole", config_before="employee", config_after="admin"), t + 1)
+        outsider = at(cloud_event("iam:UpdateRole", user_id="EMP-002", source_ip="198.51.100.77",
+                                  config_before="employee", config_after="admin"), t + 5)
+        low = agent.process_event(admin_own_laptop)[0]
+        high = agent.process_event(outsider)[0]
+        self.assertLess(low.score, high.score)
+        self.assertEqual(high.confidence, "high")
+        self.assertIn("sensitive_change_by_non_admin", high.patterns)
+
+    def test_flagged_events_do_not_become_normal(self):
+        agent, t = warmed_agent()
+        agent.analyze(timed([cloud_event("cloudtrail:StopLogging", user_id="EMP-001", source_ip="10.10.1.31",
+                                         resource="SEC-01", config_after="logging_disabled")], t))
+        self.assertNotIn("cloudtrail:StopLogging", agent.baseline.actions)
+
+    def test_burst_ends_when_activity_slows(self):
+        agent, t = warmed_agent()
+        burst = timed(attack_events("mass_data_exfiltration", burst_size=6), t)
         self.assertTrue(agent.analyze(burst))
         user = burst[0]["actor"]["user_id"]
         later = as_dict(CloudSimulator()._normal_cloud_storage_access())
         later["actor"]["user_id"] = user
+        later["network"]["source_ip"] = agent.identities[user]["workstation_ip"]
         later["data"]["api_action"] = "s3:GetObject"
-        # 30 s later: burst is over (quiet > 10 s) but still inside the 60 s volume window
-        self.assertEqual(agent.process_event(at(later, 30)), [])
-
-    def test_api_key_abuse_detected(self):
-        events = attack_events("api_key_abuse", burst_size=8)
-        flags = CloudAgent().analyze(events)
-        self.assertEqual(rules(flags), {"api_key_abuse"})
-        burst_flags = [f for f in flags if f.correlation_key]
-        self.assertTrue(burst_flags)
-        self.assertEqual(burst_flags[0].confidence, "high")
-        self.assertGreaterEqual(len(burst_flags[0].evidence["distinct_actions"]), 3)
-
-    def test_single_recon_call_is_only_a_weak_lead(self):
-        event = cloud_event("iam:ListUsers", "cloud_api_call", source_ip="10.10.1.33")
-        flags = CloudAgent().process_event(event)
-        self.assertEqual(len(flags), 1)
-        self.assertEqual(flags[0].confidence, "low")
-
-    def test_normal_api_actions_not_flagged(self):
-        agent = CloudAgent()
-        for action in ("reports:Generate", "orders:List", "profile:Get"):
-            self.assertEqual(agent.process_event(cloud_event(action, "cloud_api_call")), [])
+        later["data"]["bytes_transferred"] = 1_000_000
+        self.assertEqual(agent.process_event(at(later, t + 40)), [])
 
 
 # ======================================================================
@@ -282,20 +354,20 @@ class TestRobustness(unittest.TestCase):
         good = attack_events("public_bucket_exposure")[0]
         bad_inputs = [
             None, "not an event", 42, [], {},
-            {"event_id": "EVT-X"},                                       # missing blocks
-            {**good, "event_id": "EVT-Y", "source": "CLOUD-01"},         # wrong block type
-            {**good, "event_id": "EVT-Z", "data": ["x"]},                # data not a dict
+            {"event_id": "EVT-X"},
+            {**good, "event_id": "EVT-Y", "source": "CLOUD-01"},
+            {**good, "event_id": "EVT-Z", "data": ["x"]},
         ]
         for bad in bad_inputs:
             self.assertEqual(agent.process_event(bad), [])
         self.assertEqual(agent.stats["malformed"], len(bad_inputs))
-
         odd = [
-            {**good, "event_id": "EVT-1", "timestamp": "yesterday-ish"},  # unparseable time
+            {**good, "event_id": "EVT-1", "timestamp": "yesterday-ish"},
             {**good, "event_id": "EVT-2", "data": {"api_action": "quantum:Teleport"}},
-            {**good, "event_id": "EVT-3", "actor": {}, "network": {}},  # no user, no IP
+            {**good, "event_id": "EVT-3", "actor": {}, "network": {}},
             {**good, "event_id": "EVT-4", "data": {"api_action": "s3:GetObject", "bytes_transferred": "lots"}},
             {**good, "event_id": "EVT-5", "network": {"source_ip": "not-an-ip"}},
+            {**good, "event_id": "EVT-6", "target": {}, "data": {}},
         ]
         for event in odd:
             agent.process_event(event)  # must not raise
@@ -307,9 +379,9 @@ class TestRobustness(unittest.TestCase):
         self.assertTrue(network_keys.issubset(flag.keys()))
         self.assertEqual(flag["agent"], "cloud")
         self.assertIn(flag["confidence"], ("low", "medium", "high"))
-        for key in ("severity", "timestamp", "evidence", "user_id", "source_ip", "resource"):
+        for key in ("severity", "score", "patterns", "timestamp", "evidence", "user_id", "source_ip", "resource"):
             self.assertIn(key, flag)
-        json.dumps(flag)  # must be JSON-serialisable for the flag log
+        json.dumps(flag)
 
 
 # ======================================================================
@@ -394,15 +466,15 @@ class TestContinuousAgent(unittest.TestCase):
                         return
                     time.sleep(0.05)
 
-            sim = CloudSimulator()
-            write([as_dict(sim.generate_normal_event()) for _ in range(5)])
-            mfa = attack_events("mfa_disablement")
+            normal, t = normal_stream(5)          # spaced like the real stream
+            write(normal)
+            mfa = [at(e, t + 2) for e in attack_events("mfa_disablement")]
             write(mfa)
             wait_for(1)
 
             # the agent is still alive after flagging and picks up the next attack
             self.assertTrue(thread.is_alive())
-            bucket = attack_events("public_bucket_exposure")
+            bucket = [at(e, t + 4) for e in attack_events("public_bucket_exposure")]
             write(bucket)
             write(mfa)  # the same event appended again must not be re-flagged
             wait_for(2)
@@ -412,7 +484,10 @@ class TestContinuousAgent(unittest.TestCase):
             thread.join(timeout=5)
 
             written = [json.loads(l) for l in flags_out.read_text().splitlines()]
-            self.assertEqual([f["rule"] for f in written], ["mfa_disablement", "public_bucket_exposure"])
+            self.assertEqual(len(written), 2)
+            self.assertEqual({f["rule"] for f in written}, {"suspicious_cloud_activity"})
+            self.assertEqual(written[0]["event_ids"], [mfa[0]["event_id"]])
+            self.assertEqual(written[1]["event_ids"], [bucket[0]["event_id"]])
             self.assertEqual(agent.stats["duplicates_skipped"], 1)
             self.assertEqual(agent.stats["events_seen"], 7)
 

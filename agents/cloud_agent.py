@@ -1,57 +1,77 @@
 """
 agents/cloud_agent.py
 
-Monitoring Layer: the CLOUD SECURITY AGENT.
+Monitoring Layer: the CLOUD SECURITY AGENT (pattern-based).
 
-Watches the shared enterprise event log (storage/events.jsonl) that all
-four simulators write to, picks out the events produced by the cloud
-environment (CLOUD-01), and raises structured FLAGS when cloud activity
-looks suspicious. Like the Network Agent, it never decides "this is an
-incident" -- it produces leads for the future Coordinator Agent.
+Continuously watches the shared enterprise event log (storage/events.jsonl),
+picks out events LOGGED BY the cloud environment (CLOUD-01), and flags
+anything SUSPICIOUS -- without knowing the names of any attacks.
 
-Differences from agents/network_agent.py (which is left untouched):
-  - CONTINUOUS: it tails the log (shared.storage.event_tailer) and keeps
-    running after raising flags, instead of reading once and exiting.
-  - Each event is processed at most once (bounded event_id memory).
-  - Flags carry the Network Agent's six keys unchanged (agent, rule,
-    confidence, summary, event_ids, asset_id) PLUS extra fields
-    (severity, timestamps, evidence, correlation_key, ...), so the
-    Coordinator can read both agents' flags the same way.
+Instead of one rule per known attack, every cloud event is checked
+against general behavioural PATTERNS that attacks break, whatever they
+are called:
 
-It reads ONLY storage/events.jsonl and config/asset_registry.yaml.
-It never reads storage/ground_truth.jsonl.
+  Pattern                     Question asked of every event
+  --------------------------  ----------------------------------------------
+  security_weakening          Does this change reduce protection? (something
+                              becomes public / open to the internet, a
+                              protection is disabled or stopped, or someone
+                              gains a highly privileged role)
+  sensitive_change_*          Is someone changing identity / security /
+                              storage configuration who the registry says is
+                              not an admin -- or an admin from an unfamiliar
+                              place?
+  novelty                     Has this action / configuration value / resource
+                              ever been seen before (globally, or for this
+                              user)? Learned from observed normal traffic.
+  activity_burst              Is one identity acting far faster than the whole
+                              cloud normally produces events? (+ enumeration
+                              when the burst sweeps many different actions)
+  bulk_data_transfer          Is one identity moving far more data than the
+                              largest normal transfers seen?
+  unfamiliar_context          Unfamiliar source IP / identity not in the registry
+                              (supporting evidence only)
 
-Detection rules (details and threshold sources are next to each rule):
-  1. iam_privilege_escalation         role change INTO admin/owner
-  2. mfa_disablement                  MFA device deactivated
-  3. public_bucket_exposure           storage ACL changed to public
-  4. security_group_misconfiguration  ingress opened to 0.0.0.0/0 (or ::/0)
-  5. mass_data_exfiltration           rapid burst of object reads, or bulk bytes, by one user
-  6. api_key_abuse                    reconnaissance/secrets API calls, and
-                                      bursts of them from one API key
+Each pattern that fires adds to a SUSPICION SCORE. A flag is raised when
+the score reaches FLAG_THRESHOLD; the flag lists every pattern that fired
+and its evidence. No single weak signal (an unfamiliar IP, a first-time
+action) can raise a flag on its own.
 
-Supporting evidence (never a flag on its own):
-  - unfamiliar caller location: source_ip is not the caller's registered
-    workstation (external, or another internal host)
-  - caller not privileged per the registry's access profiles
-  - caller not found in the registry at all
-These raise a flag's confidence; they do not create flags.
+LEARNING "NORMAL":
+  - The agent builds baselines while watching: which actions/resources
+    each user uses, which configuration values occur, how fast the cloud
+    event stream normally runs, how large normal transfers are.
+  - Only events that were NOT judged suspicious update the baselines, so
+    an attacker can't teach the agent that attacks are normal.
+  - Novelty is scored only after a warm-up period (WARMUP_CLOUD_EVENTS).
+  - With --from-end, the existing log is read silently first to learn
+    the baseline, then only new events are reported.
+
+Unchanged from the first version:
+  - continuous monitoring (shared.storage.event_tailer), each event
+    processed at most once, never crashes on bad input
+  - flags keep the Network Agent's six keys (agent, rule, confidence,
+    summary, event_ids, asset_id) plus extra fields
+  - reads ONLY events.jsonl and the registry; never ground_truth.jsonl;
+    never modifies the registry
 
 Usage:
-    python -m agents.cloud_agent                  # catch up on the log, then keep watching
-    python -m agents.cloud_agent --from-end       # ignore existing events, watch new ones only
+    python -m agents.cloud_agent                  # learn from the log, report as it goes, keep watching
+    python -m agents.cloud_agent --from-end       # learn silently from the existing log, report new events only
     python -m agents.cloud_agent --once           # single pass over the log, then exit
 """
 
 import argparse
 import logging
+import re
 import signal
+import statistics
 import threading
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address, ip_network
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Set
 
 from shared.storage.event_tailer import EventTailer
 from shared.storage.event_writer import DEFAULT_EVENT_LOG_PATH, STORAGE_DIR, _append_jsonl
@@ -60,73 +80,138 @@ from shared.utils.config_loader import load_registry
 logger = logging.getLogger("cloud_agent")
 
 DEFAULT_FLAG_LOG_PATH = STORAGE_DIR / "cloud_flags.jsonl"
-
+RULE_NAME = "suspicious_cloud_activity"
 CONFIDENCE_LEVELS = ["low", "medium", "high"]  # same scale as the Network Agent
 
 
 # ----------------------------------------------------------------------
-# Rule vocabulary and thresholds
-#
-# Each value says where it comes from. "SIMULATOR" = read directly from
-# simulator/cloud/cloud_simulator.py. "HEURISTIC" = a judgement call the
-# simulator doesn't pin down; kept conservative and documented.
+# Scoring
+# ----------------------------------------------------------------------
+# HEURISTIC weights. Strong behavioural patterns score 3, so one of them
+# alone reaches the threshold; weak signals (novelty, context) score 1-2,
+# so they only matter in combination.
+WEIGHTS = {
+    "security_weakening": 3,
+    "sensitive_change_by_non_admin": 3,
+    "sensitive_change_by_unknown_identity": 3,
+    "admin_change_from_unfamiliar_location": 2,
+    "never_seen_action": 2,
+    "never_seen_config_value": 2,
+    "unusual_action_for_user": 1,
+    "unusual_resource_for_user": 1,
+    "activity_burst": 3,
+    "enumeration": 1,
+    "bulk_data_transfer": 3,
+    "unfamiliar_location": 1,
+    "unknown_identity": 2,
+}
+NOVELTY_CAP = 2          # novelty together counts at most 2 < FLAG_THRESHOLD: "new" alone is never enough
+FLAG_THRESHOLD = 3       # score needed to raise a flag
+MEDIUM_CONFIDENCE_AT = 5
+HIGH_CONFIDENCE_AT = 7
+
+
+# ----------------------------------------------------------------------
+# Learning / behaviour parameters
+# ----------------------------------------------------------------------
+# Novelty is only scored after this many cloud events have been learned.
+# SIMULATOR: the rarest normal action is ~7% of cloud events, so after 100
+# events the chance a normal action is still unseen is < 0.1%. Novelty
+# can never flag on its own anyway (max 2 < threshold 3 unless combined).
+WARMUP_CLOUD_EVENTS = 100
+
+# Burst: BURST_MIN_EVENTS events by one identity within
+# BURST_SPAN_FACTOR x the median gap between cloud events.
+# SIMULATOR: the normal stream emits one event every interval +/- 0.5 s
+# (base_simulator.start_normal_stream), so consecutive normal events are
+# at least ~0.75 x the median gap apart and 5 of them span >= ~3 median
+# gaps. 5 events inside 1.5 median gaps therefore can't come from normal
+# traffic at ANY stream speed. Adapts automatically to the cadence.
+BURST_MIN_EVENTS = 5
+BURST_SPAN_FACTOR = 1.5
+BURST_CONTINUE_FACTOR = 0.5   # burst continues while events arrive < 0.5 x median gap apart
+DEFAULT_MEDIAN_GAP_SECONDS = 0.5  # conservative until the real stream speed is learned (a normal
+                                  # stream can't put 5 events of one user inside 0.75 s)
+MIN_GAPS_FOR_ESTIMATE = 20
+ENUMERATION_DISTINCT_ACTIONS = 3  # HEURISTIC
+
+# Bulk transfer: bytes moved by one identity within the window, compared
+# with what normal traffic actually moves. The limit is the larger of
+#   BULK_FACTOR x the typical-large (95th percentile) normal transfer, and
+#   BULK_WINDOW_FACTOR x the 95th percentile normal per-identity 60 s total
+# so it adapts to how busy the stream is. Percentiles, not maxima, so one
+# unusually large transfer can't quietly raise the bar for the next ones.
+# HEURISTIC factors; defaults before learning match the simulator's
+# largest normal object (5 MB).
+BULK_WINDOW_SECONDS = 60
+BULK_FACTOR = 5
+DEFAULT_MAX_NORMAL_TRANSFER = 5_000_000
+MIN_TRANSFERS_FOR_ESTIMATE = 50
+DEFAULT_BULK_LIMIT_BEFORE_LEARNING = 50_000_000  # HEURISTIC: 10 x the largest normal object
+BULK_WINDOW_FACTOR = 3
+BULK_PERCENTILE = 0.95
+VOLUME_LEARNING_CEILING = 0.5   # learn volume only when below half the current limit
+
+MAX_SEEN_EVENT_IDS = 200_000
+
+
+# ----------------------------------------------------------------------
+# Generic security vocabulary (cloud-agnostic, not tied to any attack)
+# ----------------------------------------------------------------------
+READ_VERB_PREFIXES = ("Get", "List", "Describe", "Head", "Lookup", "Search", "Read", "View", "Check")
+MUTATING_EVENT_ACTIONS = {"modify", "create", "delete", "update", "write", "disable", "remove"}
+CONTROL_PLANE_RESOURCE_TYPES = {"identity_management", "security_configuration"}
+STORAGE_CONFIG_NOUNS = ("Bucket", "Acl", "Policy", "PublicAccess", "Encryption", "Logging", "Versioning", "Lifecycle")
+
+EXPOSURE_MARKERS = ("public", "0.0.0.0/0", "::/0", "allusers", "all_users", "everyone", "anonymous", "internet")
+PRIVILEGED_TOKENS = {"admin", "administrator", "owner", "root", "superuser", "su", "fullaccess", "poweruser", "*"}
+DISABLED_TOKENS = {"disabled", "disable", "off", "none", "false", "suspended", "stopped", "deleted", "removed", "inactive"}
+ENABLED_TOKENS = {"enabled", "enable", "on", "true", "active", "running"}
+WEAKENING_VERBS = ("Deactivate", "Disable", "Stop", "Delete", "Remove", "Detach", "Revoke", "Suspend")
+PROTECTION_NOUNS = ("mfa", "log", "trail", "audit", "monitor", "alarm", "guard", "encrypt", "backup", "flowlog", "detector")
+
+SENSITIVE_PORTS = {22, 23, 3389, 5432, 3306, 1433, 27017, 6379}
+
+
+# ----------------------------------------------------------------------
+# Helpers
 # ----------------------------------------------------------------------
 
-# Role ladder used to decide whether a role change is an escalation.
-# SIMULATOR: normal changes are employee->manager and contractor->employee
-# (ROLE_LEVELS_NORMAL); escalations end in admin or owner
-# (ROLE_LEVELS_ESCALATION). HEURISTIC: the ordering itself.
-ROLE_RANK = {"contractor": 0, "employee": 1, "manager": 2, "admin": 3, "owner": 4}
-PRIVILEGED_ROLE_RANK = ROLE_RANK["admin"]
+def _parse_timestamp(ts) -> Optional[datetime]:
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    if not isinstance(ts, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
-# SIMULATOR: the only API actions that change IAM / storage / security config.
-ROLE_CHANGE_ACTIONS = {"iam:UpdateRole"}
-MFA_DISABLE_ACTIONS = {"iam:DeactivateMFADevice"}
-BUCKET_ACL_WRITE_ACTIONS = {"s3:PutBucketAcl", "s3:PutBucketPolicy"}  # PutBucketPolicy: HEURISTIC extra
-SG_INGRESS_ACTIONS = {"ec2:AuthorizeSecurityGroupIngress"}
-OPEN_TO_WORLD_CIDRS = ("0.0.0.0/0", "::/0")
 
-# HEURISTIC: ports that are high-impact when exposed to the internet
-# (remote admin + this enterprise's own DB port 5432 from the registry).
-SENSITIVE_PORTS = {22, 3389, 5432, 3306, 1433}
+def _percentile(values, q: float) -> float:
+    ordered = sorted(values)
+    return ordered[min(int(q * len(ordered)), len(ordered) - 1)]
 
-# SIMULATOR: normal cloud_api_call actions are exactly these
-# (API_ACTIONS_NORMAL). Anything else via cloud_api_call is off-baseline.
-NORMAL_API_ACTIONS = {"reports:Generate", "orders:List", "profile:Get"}
 
-# SIMULATOR + HEURISTIC: the abuse pool is iam:ListUsers, iam:ListRoles,
-# s3:ListBuckets, ec2:DescribeInstances, secretsmanager:ListSecrets.
-# Generalised to the enumeration/secrets families those belong to.
-RECON_ACTION_PREFIXES = (
-    "iam:List", "s3:List", "ec2:Describe", "secretsmanager:", "kms:List", "sts:GetCallerIdentity",
-)
+def _tokens(value) -> Set[str]:
+    return {t for t in re.split(r"[^a-z0-9*]+", str(value or "").lower()) if t}
 
-# Mass data exfiltration: per-user sliding windows over s3:GetObject reads.
-# SIMULATOR: attack bursts are 5-20 reads (BURST_ATTACK_RANGES) spaced
-#   ~0.15 s apart (trigger_attack's burst_delay_seconds), i.e. 5 reads in
-#   under a second; each read is 0.5-20 MB. A normal read is a single
-#   object of 10 KB-5 MB.
-# Baseline: a normal event is 1 of 7 types, storage access reads half the
-#   time and there are 4 users, so ~1/56 of cloud events is a GetObject by
-#   a given user -- about one every ~2 minutes at the 2 s stream cadence.
-#   Measured against 1,500-event normal runs, "5 reads in 60 s" still
-#   happens by chance occasionally, so the COUNT rule uses a short burst
-#   window instead:
-EXFIL_WINDOW_SECONDS = 60                 # volume window, and burst "episode" length
-EXFIL_BURST_WINDOW_SECONDS = 10           # HEURISTIC: burst window for the count rule
-EXFIL_READ_COUNT_THRESHOLD = 5            # SIMULATOR: smallest attack burst
-EXFIL_BYTES_THRESHOLD = 25_000_000        # HEURISTIC: 5 x the largest normal single read (5 MB), per 60 s
 
-# API key abuse burst: per-api_key_id sliding window over off-baseline calls.
-# SIMULATOR: attack bursts are 5-15 calls cycling through 5 distinct recon
-# actions with one api_key_id. HEURISTIC: 3 distinct recon actions within
-# 60 s is flagged as enumeration (below the 5-call minimum, so every
-# simulated burst crosses it, while one-off lookups don't).
-API_BURST_WINDOW_SECONDS = 60
-API_BURST_DISTINCT_ACTIONS_THRESHOLD = 3
+def _verb(api_action: str) -> str:
+    return api_action.split(":", 1)[-1] if api_action else ""
 
-# Memory bound for "already processed" event IDs.
-MAX_SEEN_EVENT_IDS = 200_000
+
+def _is_mutation(api_action: str, event_action: str) -> bool:
+    if event_action in MUTATING_EVENT_ACTIONS:
+        return True
+    verb = _verb(api_action)
+    return bool(verb) and not verb.startswith(READ_VERB_PREFIXES) and verb not in ("StartSession", "Generate")
+
+
+def _exposed_port(config_after: str) -> Optional[int]:
+    tail = config_after.rsplit(":", 1)[-1] if ":" in config_after else ""
+    return int(tail) if tail.isdigit() else None
 
 
 # ----------------------------------------------------------------------
@@ -135,32 +220,22 @@ MAX_SEEN_EVENT_IDS = 200_000
 
 class CloudFlag:
     """
-    One thing the Cloud Agent noticed. Not a verdict -- a lead.
+    One suspicious finding. Not a verdict -- a lead for the Coordinator.
 
     to_dict() starts with exactly the Network Agent's Flag keys
-    (agent, rule, confidence, summary, event_ids, asset_id) so the
-    Coordinator can treat both uniformly; everything after that is
-    additional cloud context.
+    (agent, rule, confidence, summary, event_ids, asset_id); everything
+    after that is additional cloud context. `patterns` says WHY it is
+    suspicious; there is no attack name.
     """
 
-    def __init__(
-        self,
-        rule: str,
-        confidence: str,
-        severity: str,
-        summary: str,
-        event_ids: List[str],
-        asset_id: Optional[str],
-        timestamp: Optional[str],
-        resource: Optional[str] = None,
-        user_id: Optional[str] = None,
-        source_ip: Optional[str] = None,
-        evidence: Optional[Dict[str, Any]] = None,
-        correlation_key: Optional[str] = None,
-    ):
-        self.rule = rule
+    def __init__(self, confidence, severity, score, patterns, summary, event_ids, asset_id,
+                 timestamp, resource=None, user_id=None, source_ip=None, evidence=None,
+                 correlation_key=None):
+        self.rule = RULE_NAME
         self.confidence = confidence
         self.severity = severity
+        self.score = score
+        self.patterns = patterns
         self.summary = summary
         self.event_ids = event_ids
         self.asset_id = asset_id
@@ -183,6 +258,8 @@ class CloudFlag:
             "asset_id": self.asset_id,
             # --- cloud extensions ---
             "severity": self.severity,
+            "score": self.score,
+            "patterns": self.patterns,
             "timestamp": self.timestamp,
             "detected_at": self.detected_at,
             "resource": self.resource,
@@ -196,88 +273,71 @@ class CloudFlag:
         shown = ", ".join(self.event_ids[:3])
         more = f" (+{len(self.event_ids) - 3} more)" if len(self.event_ids) > 3 else ""
         return (
-            f"[{self.confidence.upper():6s}|{self.severity.upper():8s}] {self.rule}: "
+            f"[{self.confidence.upper():6s}|{self.severity.upper():8s}|score {self.score:>2}] "
             f"{self.summary} | events: {shown}{more}"
         )
 
 
 # ----------------------------------------------------------------------
-# Helpers
+# Baseline of normal behaviour (learned while watching)
 # ----------------------------------------------------------------------
 
-def _parse_timestamp(ts) -> Optional[datetime]:
-    if isinstance(ts, datetime):
-        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-    if not isinstance(ts, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+class _Baseline:
+    def __init__(self):
+        self.events_learned = 0
+        self.actions: Set[str] = set()
+        self.config_values: Set[str] = set()
+        self.user_actions: Dict[str, Set[str]] = defaultdict(set)
+        self.user_resources: Dict[str, Set[str]] = defaultdict(set)
+        self.gaps: Deque[float] = deque(maxlen=500)
+        self.transfer_sizes: Deque[float] = deque(maxlen=500)
+        self.window_totals: Deque[float] = deque(maxlen=500)
+        self.last_learned_time: Optional[datetime] = None
 
+    @property
+    def warmed_up(self) -> bool:
+        return self.events_learned >= WARMUP_CLOUD_EVENTS
 
-def _bump(confidence: str, steps: int = 1) -> str:
-    index = min(CONFIDENCE_LEVELS.index(confidence) + steps, len(CONFIDENCE_LEVELS) - 1)
-    return CONFIDENCE_LEVELS[index]
+    def median_gap(self) -> float:
+        if len(self.gaps) < MIN_GAPS_FOR_ESTIMATE:
+            return DEFAULT_MEDIAN_GAP_SECONDS
+        return max(statistics.median(self.gaps), 0.05)
 
+    def max_normal_transfer(self) -> float:
+        # Too few samples -> the largest one seen so far is not representative yet.
+        if len(self.transfer_sizes) < MIN_TRANSFERS_FOR_ESTIMATE:
+            return DEFAULT_MAX_NORMAL_TRANSFER
+        return _percentile(self.transfer_sizes, BULK_PERCENTILE)
 
-def _is_recon_action(api_action: str) -> bool:
-    return api_action.startswith(RECON_ACTION_PREFIXES)
+    def bulk_limit(self) -> float:
+        if len(self.transfer_sizes) < MIN_TRANSFERS_FOR_ESTIMATE:
+            return DEFAULT_BULK_LIMIT_BEFORE_LEARNING  # conservative until volume is learned
+        limit = BULK_FACTOR * self.max_normal_transfer()
+        if len(self.window_totals) >= MIN_TRANSFERS_FOR_ESTIMATE:
+            limit = max(limit, BULK_WINDOW_FACTOR * _percentile(self.window_totals, BULK_PERCENTILE))
+        return limit
 
-
-def _parse_exposed_port(config_after: str) -> Optional[int]:
-    """'0.0.0.0/0:22' -> 22. Returns None if no port is present."""
-    tail = config_after.rsplit(":", 1)[-1] if ":" in config_after else ""
-    return int(tail) if tail.isdigit() else None
-
-
-class _BurstTracker:
-    """
-    Sliding window of events per key (user, API key...), in EVENT time.
-
-    add() returns:
-      "crossed"   -- this event pushed the window over the threshold
-                     (emit one flag covering the whole window)
-      "continued" -- threshold already crossed in this burst and the
-                     burst is still going (emit a short follow-up flag)
-      None        -- below threshold
-    A burst "episode" ends when the key goes quiet for episode_gap_seconds
-    (defaults to the window), so ordinary activity after a burst is not
-    mislabelled as a continuation of it.
-    """
-
-    def __init__(self, window_seconds: int, episode_gap_seconds: Optional[int] = None):
-        self.window = timedelta(seconds=window_seconds)
-        self.episode_gap = timedelta(seconds=episode_gap_seconds or window_seconds)
-        self.items: Dict[str, Deque[dict]] = defaultdict(deque)
-        self.in_episode: Dict[str, bool] = {}
-        self.episode_ids: Dict[str, str] = {}
-        self.episode_counter = 0
-
-    def add(self, key: str, when: datetime, item: dict, is_over_threshold) -> Optional[str]:
-        window = self.items[key]
-        if window and when - window[-1]["when"] > self.episode_gap and self.in_episode.get(key):
-            # Quiet period -> the burst is over. It has already been
-            # reported, so drop its events; otherwise they would stay in
-            # the window and re-trigger the rule on the next normal event.
-            self.in_episode[key] = False
-            window.clear()
-        window.append({"when": when, **item})
-        while window and when - window[0]["when"] > self.window:
-            window.popleft()
-
-        if self.in_episode.get(key):
-            return "continued"
-        if is_over_threshold(list(window)):
-            self.in_episode[key] = True
-            self.episode_counter += 1
-            self.episode_ids[key] = f"{key}#{self.episode_counter}"
-            return "crossed"
-        return None
-
-    def window_items(self, key: str) -> List[dict]:
-        return list(self.items[key])
+    def learn(self, f: dict) -> None:
+        self.events_learned += 1
+        if f["api_action"]:
+            self.actions.add(f["api_action"])
+            self.user_actions[f["identity"]].add(f["api_action"])
+        if f["resource"]:
+            self.user_resources[f["identity"]].add(f["resource"])
+        if f["config_after"]:
+            self.config_values.add(f["config_after"].lower())
+        # Volume is learned only while it is clearly within normal range, so
+        # an attacker ramping up slowly can't drag the baseline up with them.
+        if f["bytes"] > 0 and f.get("window_bytes", 0) <= VOLUME_LEARNING_CEILING * self.bulk_limit():
+            self.transfer_sizes.append(f["bytes"])
+            if f.get("window_bytes"):
+                self.window_totals.append(f["window_bytes"])
+        if f["when"] is not None:
+            if self.last_learned_time is not None:
+                gap = (f["when"] - self.last_learned_time).total_seconds()
+                if gap > 0:
+                    self.gaps.append(gap)
+            self.last_learned_time = f["when"]
 
 
 # ----------------------------------------------------------------------
@@ -286,10 +346,8 @@ class _BurstTracker:
 
 class CloudAgent:
     """
-    Analyses raw event dicts (as stored in events.jsonl) one at a time.
-
-    process_event(event) -> list of CloudFlag   (streaming entry point)
-    analyze(events)      -> list of CloudFlag   (batch convenience, like NetworkAgent.analyze)
+    process_event(event, report=True) -> list of CloudFlag   (streaming entry point)
+    analyze(events)                   -> list of CloudFlag   (batch convenience)
     """
 
     def __init__(self, registry: Optional[dict] = None):
@@ -297,29 +355,28 @@ class CloudAgent:
 
         self.internal_net = ip_network(registry["network"]["cidr"])
         assets = {a["asset_id"]: a for a in registry.get("assets", [])}
-        self.cloud_asset_ids = {
-            aid for aid, a in assets.items() if a.get("asset_type") == "cloud_environment"
+        self.cloud_asset_ids = {aid for aid, a in assets.items() if a.get("asset_type") == "cloud_environment"}
+        self.resource_types = {
+            r["resource_id"]: r.get("resource_type") for r in registry.get("cloud_resources", []) or []
         }
         profiles = registry.get("access_profiles", {}) or {}
-
-        # user_id -> what the registry says about that person
         self.identities: Dict[str, dict] = {}
         for emp in registry.get("employees", []):
-            workstation = assets.get(emp.get("workstation_id"), {})
             profile = profiles.get(emp.get("access_profile"), {}) or {}
             self.identities[emp["employee_id"]] = {
-                "username": emp.get("username"),
-                "workstation_ip": workstation.get("ip_address"),
+                "workstation_ip": assets.get(emp.get("workstation_id"), {}).get("ip_address"),
                 "privileged": bool(profile.get("privileged", False)),
-                "role": emp.get("role"),
             }
 
-        self._seen_ids: set = set()
+        self.baseline = _Baseline()
+        self._seen_ids: Set[str] = set()
         self._seen_order: Deque[str] = deque()
+        self._recent: Dict[str, Deque[dict]] = defaultdict(deque)  # identity -> recent events
+        self._burst_active: Dict[str, bool] = {}
+        self._burst_key: Dict[str, str] = {}
+        self._burst_members: Dict[str, List[dict]] = {}
+        self._burst_counter = 0
         self.stats = defaultdict(int)
-
-        self._exfil = _BurstTracker(EXFIL_WINDOW_SECONDS, episode_gap_seconds=EXFIL_BURST_WINDOW_SECONDS)
-        self._api_keys = _BurstTracker(API_BURST_WINDOW_SECONDS)
 
     # ------------------------------------------------------------
     # Entry points
@@ -331,12 +388,15 @@ class CloudAgent:
             flags += self.process_event(event)
         return flags
 
-    def process_event(self, event: Any) -> List[CloudFlag]:
-        """Analyse ONE event. Safe on any input: never raises, never double-processes."""
+    def process_event(self, event: Any, report: bool = True) -> List[CloudFlag]:
+        """
+        Analyse ONE event. Never raises, never processes an event twice.
+        report=False scores and learns silently (used to bootstrap the
+        baseline from an existing log).
+        """
         if not self._is_well_formed(event):
             self.stats["malformed"] += 1
             return []
-
         event_id = event["event_id"]
         if event_id in self._seen_ids:
             self.stats["duplicates_skipped"] += 1
@@ -350,24 +410,22 @@ class CloudAgent:
         self.stats["cloud_events_analyzed"] += 1
 
         try:
-            ctx = self._caller_context(event)
-            flags: List[CloudFlag] = []
-            for rule in (
-                self._rule_iam_privilege_escalation,
-                self._rule_mfa_disablement,
-                self._rule_public_bucket_exposure,
-                self._rule_security_group_misconfiguration,
-                self._rule_mass_data_exfiltration,
-                self._rule_api_key_abuse,
-            ):
-                flags += rule(event, ctx)
-        except Exception:  # defensive: one odd event must never stop monitoring
+            features = self._extract(event)
+            signals = self._score(features)
+            score = self._total(signals)
+            suspicious = score >= FLAG_THRESHOLD or features["in_burst"]
+            if not suspicious:
+                self.baseline.learn(features)
+            if not suspicious or not report:
+                return []
+            flag = self._make_flag(event, features, signals, score)
+        except Exception:  # one odd event must never stop monitoring
             logger.exception("Error analysing event %s; skipping it.", event_id)
             self.stats["errors"] += 1
             return []
 
-        self.stats["flags_raised"] += len(flags)
-        return flags
+        self.stats["flags_raised"] += 1
+        return [flag]
 
     # ------------------------------------------------------------
     # Input handling
@@ -392,311 +450,273 @@ class CloudAgent:
             self._seen_ids.discard(self._seen_order.popleft())
 
     def _is_cloud_event(self, event: dict) -> bool:
-        """
-        A cloud event is one LOGGED BY the cloud environment. Endpoint
-        events that merely connect TO CLOUD-01 are the Endpoint/Network
-        agents' concern and are ignored here.
-        """
+        """Logged BY the cloud. Endpoint events connecting TO CLOUD-01 are other agents' concern."""
         source = event["source"]
-        return (
-            source.get("asset_type") == "cloud_environment"
-            or source.get("asset_id") in self.cloud_asset_ids
-        )
+        return source.get("asset_type") == "cloud_environment" or source.get("asset_id") in self.cloud_asset_ids
 
-    def _caller_context(self, event: dict) -> dict:
-        """Who made this cloud call and from where, checked against the registry."""
-        user_id = (event.get("actor") or {}).get("user_id")
-        source_ip = (event.get("network") or {}).get("source_ip")
-        identity = self.identities.get(user_id)
+    # ------------------------------------------------------------
+    # Feature extraction -- only fields every cloud event carries
+    # ------------------------------------------------------------
+
+    def _extract(self, event: dict) -> dict:
+        data = event.get("data") or {}
+        target = event.get("target") or {}
+        actor = event.get("actor") or {}
+        network = event.get("network") or {}
+
+        user_id = actor.get("user_id")
+        source_ip = network.get("source_ip")
+        identity_info = self.identities.get(user_id)
+        api_key_id = data.get("api_key_id")
+        identity = user_id or (f"key:{api_key_id}" if api_key_id else None) or f"ip:{source_ip}"
 
         location = "unknown"
         if source_ip:
             try:
-                is_internal = ip_address(str(source_ip)) in self.internal_net
+                internal = ip_address(str(source_ip)) in self.internal_net
             except ValueError:
-                is_internal = False
-            if identity and str(source_ip) == identity["workstation_ip"]:
+                internal = False
+            if identity_info and str(source_ip) == identity_info["workstation_ip"]:
                 location = "registered_workstation"
-            elif is_internal:
-                location = "other_internal_host"
             else:
-                location = "external"
+                location = "other_internal_host" if internal else "external"
 
+        resource = target.get("resource")
+        bytes_moved = data.get("bytes_transferred") or 0
         return {
+            "event_id": event["event_id"],
+            "identity": identity,
             "user_id": user_id,
+            "known_user": identity_info is not None,
+            "privileged": bool(identity_info and identity_info["privileged"]),
             "source_ip": str(source_ip) if source_ip else None,
-            "known_user": identity is not None,
-            "privileged": bool(identity and identity["privileged"]),
-            "caller_location": location,
-            "unfamiliar_location": location in ("external", "other_internal_host"),
+            "location": location,
             "when": _parse_timestamp(event.get("timestamp")),
+            "api_action": str(data.get("api_action") or ""),
+            "event_action": str(event["event"].get("action") or "").lower(),
+            "event_type": event["event"].get("type"),
+            "resource": resource,
+            "resource_type": target.get("resource_type") or self.resource_types.get(resource),
+            "config_before": str(data["config_before"]) if data.get("config_before") is not None else "",
+            "config_after": str(data["config_after"]) if data.get("config_after") is not None else "",
+            "bytes": bytes_moved if isinstance(bytes_moved, (int, float)) and bytes_moved > 0 else 0,
+            "api_key_id": api_key_id,
+            "in_burst": False,
         }
 
-    def _supporting_signals(self, ctx: dict, needs_privilege: bool) -> List[str]:
-        signals = []
-        if ctx["unfamiliar_location"]:
-            signals.append(f"caller_location={ctx['caller_location']}")
-        if not ctx["known_user"]:
-            signals.append("caller_not_in_registry")
-        elif needs_privilege and not ctx["privileged"]:
-            signals.append("caller_not_privileged")
+    # ------------------------------------------------------------
+    # Patterns
+    # ------------------------------------------------------------
+
+    def _score(self, f: dict) -> Dict[str, dict]:
+        signals: Dict[str, dict] = {}
+        signals.update(self._pattern_security_weakening(f))
+        signals.update(self._pattern_sensitive_change(f))
+        signals.update(self._pattern_novelty(f))
+        signals.update(self._pattern_behaviour(f))
+        signals.update(self._pattern_context(f))
         return signals
 
-    def _make_flag(self, event, ctx, rule, base_confidence, severity, summary,
-                   evidence, needs_privilege, event_ids=None, correlation_key=None) -> CloudFlag:
-        signals = self._supporting_signals(ctx, needs_privilege)
-        confidence = _bump(base_confidence, len(signals)) if signals else base_confidence
-        target = event.get("target") or {}
-        data = event.get("data") or {}
-        full_evidence = {
-            "api_action": data.get("api_action"),
-            "event_type": event["event"].get("type"),
-            "call_source": data.get("call_source"),
-            "caller_location": ctx["caller_location"],
-            "caller_privileged": ctx["privileged"],
-            "supporting_signals": signals,
-            **evidence,
-        }
+    @staticmethod
+    def _total(signals: Dict[str, dict]) -> int:
+        novelty = sum(WEIGHTS[n] for n in signals if n in
+                      ("never_seen_action", "never_seen_config_value", "unusual_action_for_user", "unusual_resource_for_user"))
+        other = sum(WEIGHTS[n] for n in signals if n not in
+                    ("never_seen_action", "never_seen_config_value", "unusual_action_for_user", "unusual_resource_for_user"))
+        return other + min(novelty, NOVELTY_CAP)
+
+    def _pattern_security_weakening(self, f: dict) -> Dict[str, dict]:
+        """A change that leaves the environment LESS protected, whatever API did it."""
+        before, after = f["config_before"].lower(), f["config_after"].lower()
+        before_t, after_t = _tokens(before), _tokens(after)
+        reasons = []
+
+        if after and any(m in after for m in EXPOSURE_MARKERS) and not any(m in before for m in EXPOSURE_MARKERS):
+            port = _exposed_port(after)
+            reasons.append(f"exposed to the internet/public ({f['config_before']} -> {f['config_after']})"
+                           + (f", sensitive port {port}" if port in SENSITIVE_PORTS else ""))
+        if (after_t & DISABLED_TOKENS) and not (before_t & DISABLED_TOKENS):
+            reasons.append(f"protection disabled ({f['config_before']} -> {f['config_after']})")
+        if (after_t & PRIVILEGED_TOKENS) and not (before_t & PRIVILEGED_TOKENS):
+            reasons.append(f"privilege gained ({f['config_before'] or '?'} -> {f['config_after']})")
+
+        verb = _verb(f["api_action"])
+        action_l = f["api_action"].lower()
+        if verb.startswith(WEAKENING_VERBS) and any(n in action_l for n in PROTECTION_NOUNS):
+            reasons.append(f"security control turned off via {f['api_action']}")
+
+        if not reasons:
+            return {}
+        port = _exposed_port(after)
+        critical = any("exposed" in r for r in reasons) or port in SENSITIVE_PORTS
+        return {"security_weakening": {"reasons": reasons, "critical": critical}}
+
+    def _pattern_sensitive_change(self, f: dict) -> Dict[str, dict]:
+        """A mutation of identity / security / storage configuration, judged by who and from where."""
+        if not _is_mutation(f["api_action"], f["event_action"]):
+            return {}
+        control_plane = f["resource_type"] in CONTROL_PLANE_RESOURCE_TYPES or (
+            f["resource_type"] == "object_storage" and any(n in _verb(f["api_action"]) for n in STORAGE_CONFIG_NOUNS)
+        )
+        if not control_plane:
+            return {}
+        detail = {"api_action": f["api_action"], "resource": f["resource"], "resource_type": f["resource_type"]}
+        if not f["known_user"]:
+            return {"sensitive_change_by_unknown_identity": detail}
+        if not f["privileged"]:
+            return {"sensitive_change_by_non_admin": detail}
+        if f["location"] != "registered_workstation":
+            return {"admin_change_from_unfamiliar_location": {**detail, "location": f["location"]}}
+        return {}
+
+    def _pattern_novelty(self, f: dict) -> Dict[str, dict]:
+        """Things never observed during normal operation (after warm-up)."""
+        b = self.baseline
+        if not b.warmed_up:
+            return {}
+        signals = {}
+        action = f["api_action"]
+        if action and action not in b.actions:
+            signals["never_seen_action"] = {"api_action": action}
+        elif action and action not in b.user_actions.get(f["identity"], set()):
+            signals["unusual_action_for_user"] = {"api_action": action}
+        if f["config_after"] and f["config_after"].lower() not in b.config_values:
+            signals["never_seen_config_value"] = {"config_after": f["config_after"]}
+        if f["resource"] and f["resource"] not in b.user_resources.get(f["identity"], set()):
+            signals["unusual_resource_for_user"] = {"resource": f["resource"]}
+        return signals
+
+    def _pattern_behaviour(self, f: dict) -> Dict[str, dict]:
+        """Rate and volume per identity, relative to the learned stream speed and transfer sizes."""
+        if f["when"] is None:
+            return {}
+        signals = {}
+        key = f["identity"]
+        recent = self._recent[key]
+        gap = self.baseline.median_gap()
+
+        # an ongoing burst ends once the identity slows back down
+        if recent and self._burst_active.get(key):
+            if (f["when"] - recent[-1]["when"]).total_seconds() > BURST_CONTINUE_FACTOR * gap:
+                self._burst_active[key] = False
+                recent.clear()
+
+        recent.append({"when": f["when"], "event_id": f["event_id"], "action": f["api_action"], "bytes": f["bytes"]})
+        horizon = f["when"] - timedelta(seconds=max(BULK_WINDOW_SECONDS, BURST_SPAN_FACTOR * gap * 4))
+        while recent and recent[0]["when"] < horizon:
+            recent.popleft()
+
+        # --- activity burst ---
+        last_n = list(recent)[-BURST_MIN_EVENTS:]
+        started = False
+        if self._burst_active.get(key):
+            self._burst_members[key].append(recent[-1])
+        elif len(last_n) >= BURST_MIN_EVENTS and \
+                (last_n[-1]["when"] - last_n[0]["when"]).total_seconds() <= BURST_SPAN_FACTOR * gap:
+            self._burst_active[key] = True
+            self._burst_counter += 1
+            self._burst_key[key] = f"{key}#burst{self._burst_counter}"
+            self._burst_members[key] = list(last_n)
+            started = True
+
+        if self._burst_active.get(key):
+            f["in_burst"] = True
+            members = self._burst_members[key]
+            actions = sorted({m["action"] for m in members if m["action"]})
+            signals["activity_burst"] = {
+                "events_in_burst": len(members),
+                "normal_median_gap_seconds": round(gap, 2),
+                "burst_started": started,
+                # the flag that STARTS a burst covers every event in it so far;
+                # later flags cover just their own event
+                "burst_event_ids": [m["event_id"] for m in members] if started else [f["event_id"]],
+                "correlation_key": self._burst_key[key],
+            }
+            if len(actions) >= ENUMERATION_DISTINCT_ACTIONS:
+                signals["enumeration"] = {"distinct_actions": actions}
+
+        # --- bulk data transfer ---
+        cutoff = f["when"] - timedelta(seconds=BULK_WINDOW_SECONDS)
+        window_bytes = sum(r["bytes"] for r in recent if r["when"] >= cutoff)
+        f["window_bytes"] = window_bytes
+        limit = self.baseline.bulk_limit()
+        if f["bytes"] > 0 and window_bytes >= limit:
+            signals["bulk_data_transfer"] = {
+                "bytes_in_window": int(window_bytes),
+                "window_seconds": BULK_WINDOW_SECONDS,
+                "limit_bytes": int(limit),
+            }
+            for r in recent:  # reported: don't let these bytes re-trigger on later events
+                r["bytes"] = 0
+        return signals
+
+    def _pattern_context(self, f: dict) -> Dict[str, dict]:
+        """Supporting evidence only (weights too small to flag alone)."""
+        if not f["known_user"] and f["user_id"]:
+            return {"unknown_identity": {"user_id": f["user_id"]}}
+        if f["location"] in ("external", "other_internal_host"):
+            return {"unfamiliar_location": {"source_ip": f["source_ip"], "location": f["location"]}}
+        return {}
+
+    # ------------------------------------------------------------
+    # Flag construction
+    # ------------------------------------------------------------
+
+    def _make_flag(self, event: dict, f: dict, signals: Dict[str, dict], score: int) -> CloudFlag:
+        if score >= HIGH_CONFIDENCE_AT:
+            confidence = "high"
+        elif score >= MEDIUM_CONFIDENCE_AT:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        weakening = signals.get("security_weakening")
+        if weakening and weakening["critical"]:
+            severity = "critical"
+        elif weakening or "bulk_data_transfer" in signals or any(k.startswith("sensitive_change") for k in signals):
+            severity = "high"
+        else:
+            severity = "medium"
+
+        patterns = sorted(signals, key=lambda n: -WEIGHTS[n])
+        burst = signals.get("activity_burst")
+        event_ids = burst["burst_event_ids"] if burst else [f["event_id"]]
+        who = f["user_id"] or f["identity"]
+        headline = []
+        if weakening:
+            headline.append("; ".join(weakening["reasons"]))
+        if burst:
+            headline.append(f"burst of {burst['events_in_burst']} events (normal gap ~{burst['normal_median_gap_seconds']}s)")
+        if "bulk_data_transfer" in signals:
+            headline.append(f"{signals['bulk_data_transfer']['bytes_in_window']:,} bytes moved in {BULK_WINDOW_SECONDS}s")
+        others = [p for p in patterns if p not in ("security_weakening", "activity_burst", "bulk_data_transfer")]
+        summary = f"{who} via {f['api_action'] or f['event_type']} on {f['resource']}: " + " | ".join(
+            headline + ([", ".join(others)] if others else [])
+        )
+
         return CloudFlag(
-            rule=rule,
             confidence=confidence,
             severity=severity,
+            score=score,
+            patterns=patterns,
             summary=summary,
-            event_ids=event_ids or [event["event_id"]],
-            asset_id=target.get("asset_id") or event["source"].get("asset_id"),
+            event_ids=event_ids,
+            asset_id=(event.get("target") or {}).get("asset_id") or event["source"].get("asset_id"),
             timestamp=str(event.get("timestamp")),
-            resource=target.get("resource"),
-            user_id=ctx["user_id"],
-            source_ip=ctx["source_ip"],
-            evidence=full_evidence,
-            correlation_key=correlation_key,
+            resource=f["resource"],
+            user_id=f["user_id"],
+            source_ip=f["source_ip"],
+            evidence={
+                "api_action": f["api_action"],
+                "event_type": f["event_type"],
+                "config_before": f["config_before"] or None,
+                "config_after": f["config_after"] or None,
+                "caller_location": f["location"],
+                "caller_privileged": f["privileged"],
+                "signals": signals,
+            },
+            correlation_key=burst["correlation_key"] if burst else None,
         )
-
-    # ------------------------------------------------------------
-    # Rule 1: IAM privilege escalation
-    # A role change is routine (the simulator's IT admin does
-    # employee->manager); a change that ENDS in admin/owner from a lower
-    # role is a privilege grab. Same event type either way -- the roles
-    # in config_before/config_after are what separate them.
-    # ------------------------------------------------------------
-
-    def _rule_iam_privilege_escalation(self, event, ctx) -> List[CloudFlag]:
-        data = event.get("data") or {}
-        if data.get("api_action") not in ROLE_CHANGE_ACTIONS:
-            return []
-        before = str(data.get("config_before", "")).lower()
-        after = str(data.get("config_after", "")).lower()
-        if before not in ROLE_RANK or after not in ROLE_RANK:
-            return []
-        if not (ROLE_RANK[after] >= PRIVILEGED_ROLE_RANK and ROLE_RANK[after] > ROLE_RANK[before]):
-            return []
-        jump = ROLE_RANK[after] - ROLE_RANK[before]
-        return [self._make_flag(
-            event, ctx,
-            rule="iam_privilege_escalation",
-            base_confidence="medium",
-            severity="high",
-            summary=f"{ctx['user_id']} changed a role {before} -> {after} ({jump}-level jump into a privileged role)",
-            evidence={"config_before": before, "config_after": after, "privilege_jump": jump},
-            needs_privilege=True,
-        )]
-
-    # ------------------------------------------------------------
-    # Rule 2: MFA disablement
-    # The simulator has no legitimate MFA-disable activity at all, and
-    # turning MFA off is a classic account-takeover persistence step.
-    # ------------------------------------------------------------
-
-    def _rule_mfa_disablement(self, event, ctx) -> List[CloudFlag]:
-        data = event.get("data") or {}
-        by_action = data.get("api_action") in MFA_DISABLE_ACTIONS
-        by_state = (
-            str(data.get("config_before", "")).lower() == "mfa_enabled"
-            and str(data.get("config_after", "")).lower() == "mfa_disabled"
-        )
-        if not (by_action or by_state):
-            return []
-        return [self._make_flag(
-            event, ctx,
-            rule="mfa_disablement",
-            base_confidence="high",
-            severity="high",
-            summary=f"MFA disabled via {data.get('api_action')} by {ctx['user_id']}",
-            evidence={"config_before": data.get("config_before"), "config_after": data.get("config_after")},
-            needs_privilege=True,
-        )]
-
-    # ------------------------------------------------------------
-    # Rule 3: public bucket exposure
-    # Normal storage config activity only READS the ACL (s3:GetBucketAcl).
-    # A write that leaves the bucket public exposes enterprise files
-    # (STORAGE-01) to the internet.
-    # ------------------------------------------------------------
-
-    def _rule_public_bucket_exposure(self, event, ctx) -> List[CloudFlag]:
-        data = event.get("data") or {}
-        if data.get("api_action") not in BUCKET_ACL_WRITE_ACTIONS:
-            return []
-        after = str(data.get("config_after", "")).lower()
-        if "public" not in after:
-            return []
-        return [self._make_flag(
-            event, ctx,
-            rule="public_bucket_exposure",
-            base_confidence="high",
-            severity="critical",
-            summary=(
-                f"Storage {(event.get('target') or {}).get('resource')} ACL changed "
-                f"{data.get('config_before')} -> {data.get('config_after')}"
-            ),
-            evidence={"config_before": data.get("config_before"), "config_after": data.get("config_after")},
-            needs_privilege=True,
-        )]
-
-    # ------------------------------------------------------------
-    # Rule 4: security group misconfiguration
-    # Normal activity only DESCRIBES security groups. Opening ingress to
-    # the whole internet is flagged; a sensitive port (SSH 22 in the
-    # simulator) raises severity to critical.
-    # ------------------------------------------------------------
-
-    def _rule_security_group_misconfiguration(self, event, ctx) -> List[CloudFlag]:
-        data = event.get("data") or {}
-        if data.get("api_action") not in SG_INGRESS_ACTIONS:
-            return []
-        after = str(data.get("config_after", ""))
-        if not any(cidr in after for cidr in OPEN_TO_WORLD_CIDRS):
-            return []
-        port = _parse_exposed_port(after)
-        sensitive = port in SENSITIVE_PORTS
-        return [self._make_flag(
-            event, ctx,
-            rule="security_group_misconfiguration",
-            base_confidence="high",
-            severity="critical" if sensitive else "high",
-            summary=(
-                f"Ingress opened to the internet ({after})"
-                + (f" on sensitive port {port}" if sensitive else "")
-            ),
-            evidence={"config_before": data.get("config_before"), "config_after": after,
-                      "exposed_port": port, "sensitive_port": sensitive},
-            needs_privilege=True,
-        )]
-
-    # ------------------------------------------------------------
-    # Rule 5: mass data exfiltration (stateful)
-    # One object read is normal. Many reads / many bytes by the SAME user
-    # in a short window is a sweep. Keyed by user, not session, so it
-    # doesn't depend on the attacker reusing one session.
-    # ------------------------------------------------------------
-
-    def _rule_mass_data_exfiltration(self, event, ctx) -> List[CloudFlag]:
-        data = event.get("data") or {}
-        if data.get("api_action") != "s3:GetObject" or ctx["when"] is None:
-            return []
-        key = f"exfil:{ctx['user_id']}"
-        bytes_read = data.get("bytes_transferred") or 0
-        if not isinstance(bytes_read, (int, float)):
-            bytes_read = 0
-
-        def over(window):
-            latest = window[-1]["when"]
-            burst = [i for i in window if (latest - i["when"]).total_seconds() <= EXFIL_BURST_WINDOW_SECONDS]
-            return (len(burst) >= EXFIL_READ_COUNT_THRESHOLD
-                    or sum(i["bytes"] for i in window) >= EXFIL_BYTES_THRESHOLD)
-
-        state = self._exfil.add(key, ctx["when"], {"event_id": event["event_id"], "bytes": bytes_read,
-                                                   "object": data.get("object_key")}, over)
-        if state is None:
-            return []
-
-        window = self._exfil.window_items(key)
-        total_bytes = sum(i["bytes"] for i in window)
-        correlation_key = self._exfil.episode_ids[key]
-        if state == "crossed":
-            return [self._make_flag(
-                event, ctx,
-                rule="mass_data_exfiltration",
-                base_confidence="medium",
-                severity="high",
-                summary=(
-                    f"{ctx['user_id']} read {len(window)} objects ({total_bytes:,} bytes) "
-                    f"within {EXFIL_WINDOW_SECONDS}s"
-                ),
-                evidence={"objects_read": len(window), "total_bytes": total_bytes,
-                          "window_seconds": EXFIL_WINDOW_SECONDS,
-                          "objects": sorted({i["object"] for i in window if i["object"]})},
-                needs_privilege=False,
-                event_ids=[i["event_id"] for i in window],
-                correlation_key=correlation_key,
-            )]
-        return [self._make_flag(
-            event, ctx,
-            rule="mass_data_exfiltration",
-            base_confidence="medium",
-            severity="high",
-            summary=f"Exfiltration burst continues: {ctx['user_id']} now at {len(window)} reads / {total_bytes:,} bytes",
-            evidence={"objects_read": len(window), "total_bytes": total_bytes, "continuation": True},
-            needs_privilege=False,
-            correlation_key=correlation_key,
-        )]
-
-    # ------------------------------------------------------------
-    # Rule 6: API key abuse (per event + stateful)
-    # Normal cloud_api_call traffic uses a small, fixed set of business
-    # actions. Enumeration/secrets calls are off-baseline (medium). The
-    # same api_key_id sweeping several distinct recon actions quickly is
-    # key abuse (high).
-    # ------------------------------------------------------------
-
-    def _rule_api_key_abuse(self, event, ctx) -> List[CloudFlag]:
-        data = event.get("data") or {}
-        if event["event"].get("type") != "cloud_api_call":
-            return []
-        api_action = str(data.get("api_action") or "")
-        if not api_action or api_action in NORMAL_API_ACTIONS or not _is_recon_action(api_action):
-            return []
-
-        api_key_id = data.get("api_key_id")
-        burst_key = f"apikey:{api_key_id or ctx['user_id']}"
-        state = None
-        if ctx["when"] is not None:
-            def over(window):
-                return len({i["action"] for i in window}) >= API_BURST_DISTINCT_ACTIONS_THRESHOLD
-            state = self._api_keys.add(burst_key, ctx["when"],
-                                       {"event_id": event["event_id"], "action": api_action}, over)
-
-        if state == "crossed":
-            window = self._api_keys.window_items(burst_key)
-            actions = sorted({i["action"] for i in window})
-            return [self._make_flag(
-                event, ctx,
-                rule="api_key_abuse",
-                base_confidence="high",
-                severity="high",
-                summary=(
-                    f"API key {api_key_id or '(none)'} made {len(window)} reconnaissance calls "
-                    f"({len(actions)} distinct actions) within {API_BURST_WINDOW_SECONDS}s"
-                ),
-                evidence={"api_key_id": api_key_id, "distinct_actions": actions, "calls": len(window)},
-                needs_privilege=False,
-                event_ids=[i["event_id"] for i in window],
-                correlation_key=self._api_keys.episode_ids[burst_key],
-            )]
-
-        return [self._make_flag(
-            event, ctx,
-            rule="api_key_abuse",
-            base_confidence="high" if state == "continued" else "low",
-            severity="high" if state == "continued" else "medium",
-            summary=(
-                f"Reconnaissance API call {api_action} (outside normal API baseline)"
-                + (" -- part of an ongoing key-abuse burst" if state == "continued" else "")
-            ),
-            evidence={"api_key_id": api_key_id, "continuation": state == "continued"},
-            needs_privilege=False,
-            correlation_key=self._api_keys.episode_ids.get(burst_key) if state == "continued" else None,
-        )]
 
 
 # ----------------------------------------------------------------------
@@ -712,12 +732,9 @@ def run(
     stop_event: Optional[threading.Event] = None,
     agent: Optional[CloudAgent] = None,
 ) -> CloudAgent:
-    """
-    Watch the event log and analyse every new event as it arrives.
-    Keeps running after raising flags; stop with Ctrl+C (or stop_event).
-    """
+    """Watch the event log, analyse each new event, keep running after flags."""
     agent = agent or CloudAgent()
-    tailer = EventTailer(path, start_at_end=from_end)
+    tailer = EventTailer(path)
 
     def handle(record: dict) -> None:
         for flag in agent.process_event(record):
@@ -725,11 +742,20 @@ def run(
             if output_path is not None:
                 _append_jsonl(Path(output_path), flag.to_dict())
 
-    mode = "single pass" if once else ("watching new events only" if from_end else "catching up, then watching")
-    print(f"Cloud Agent: monitoring {path} ({mode})")
+    print(f"Cloud Agent (pattern-based): monitoring {path}")
+    if from_end:
+        learned = 0
+        for record in tailer.poll():  # silent pass: learn the baseline from history
+            agent.process_event(record, report=False)
+            learned += 1
+        print(f"Learned baseline from {learned} existing events "
+              f"({agent.baseline.events_learned} normal cloud events); reporting new events only.")
     if output_path is not None:
         print(f"Flags are also written to {output_path}")
-    print("Press Ctrl+C to stop.\n" if not once else "", end="", flush=True)
+    if not agent.baseline.warmed_up:
+        print(f"Warm-up: novelty checks start after {WARMUP_CLOUD_EVENTS} normal cloud events "
+              f"(other patterns are active immediately).")
+    print("" if once else "Press Ctrl+C to stop.\n", end="", flush=True)
 
     try:
         if once:
@@ -743,6 +769,7 @@ def run(
     finally:
         stats = dict(agent.stats)
         stats["malformed_lines"] = tailer.malformed_lines
+        stats["baseline_events"] = agent.baseline.events_learned
         print(f"\nCloud Agent stopped. Stats: {stats}")
     return agent
 
@@ -754,13 +781,13 @@ if __name__ == "__main__":
         raise KeyboardInterrupt  # handled in run(): prints stats and exits cleanly
 
     signal.signal(signal.SIGTERM, _graceful_stop)  # e.g. `docker stop`
-    parser = argparse.ArgumentParser(description="Run the Cloud Security Agent (continuous monitoring).")
-    parser.add_argument("--path", type=Path, default=DEFAULT_EVENT_LOG_PATH,
-                        help=f"Event log to watch (default: {DEFAULT_EVENT_LOG_PATH})")
-    parser.add_argument("--output", type=Path, default=DEFAULT_FLAG_LOG_PATH,
-                        help=f"Where to append flags as JSONL (default: {DEFAULT_FLAG_LOG_PATH})")
+
+    parser = argparse.ArgumentParser(description="Run the Cloud Security Agent (pattern-based, continuous).")
+    parser.add_argument("--path", type=Path, default=DEFAULT_EVENT_LOG_PATH, help="Event log to watch")
+    parser.add_argument("--output", type=Path, default=DEFAULT_FLAG_LOG_PATH, help="Where to append flags (JSONL)")
     parser.add_argument("--no-output", action="store_true", help="Print flags only; don't write a flag file")
-    parser.add_argument("--from-end", action="store_true", help="Skip events already in the log; watch new ones only")
+    parser.add_argument("--from-end", action="store_true",
+                        help="Learn silently from the existing log, then report new events only")
     parser.add_argument("--once", action="store_true", help="Single pass over the log, then exit")
     parser.add_argument("--poll-interval", type=float, default=1.0, help="Seconds between checks for new events")
     args = parser.parse_args()
